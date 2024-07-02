@@ -106,6 +106,7 @@ def load_features_from_vcf(
         stdev_pos = float(info["STDEV_POS"]) if "STDEV_POS" in info else 0
         stdev_len = float(info["STDEV_LEN"]) if "STDEV_LEN" in info else 0
 
+
         x[-1].append(q_score)
         if r == 0:
             feature_names.append("q_score")
