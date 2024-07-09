@@ -1,5 +1,5 @@
 from modules.shallow_linear import ShallowLinear
-from modules.data_loader import VcfDataset
+from modules.data_loader import VcfDatasetBNDs
 from collections import defaultdict
 from torch import multiprocessing
 
@@ -16,7 +16,6 @@ from sklearn.metrics import confusion_matrix
 from sklearn.metrics import roc_curve, roc_auc_score
 
 from matplotlib import pyplot
-
 
 import numpy as np
 
@@ -58,7 +57,7 @@ def train(model, train_loader, test_loader, optimizer, scheduler, loss_fn, epoch
 
     batch_index = 0
     for e in range(epochs):
-        for i, (x, y) in enumerate(train_loader.iter_balanced_batches(max_batches_per_epoch=max_batches_per_epoch)):
+        for i, (x, y) in enumerate(train_loader):
             if i >= max_batches_per_epoch:
                 break
 
@@ -66,6 +65,8 @@ def train(model, train_loader, test_loader, optimizer, scheduler, loss_fn, epoch
 
             n_positive = sum(y.data.numpy())
             n_negative = len(y) - n_positive
+
+            print(i,n_positive,n_negative)
 
             n_total_positive += n_positive
             n_total_negative += n_negative
@@ -136,7 +137,7 @@ def test(model, loader, loss_fn, use_sigmoid=False):
     losses = list()
 
     batch_index = 0
-    for x, y in loader.iter_batches():
+    for x, y in loader:
         y_predict = model.forward(x, use_sigmoid=use_sigmoid)
 
         y_vectors.append(y.data.numpy())
@@ -182,7 +183,7 @@ def run(dataset_train, dataset_test, output_dir, downsample=False):
     weight_decay = 4e-6
     dropout_rate = 0.01
 
-    goal_batch_size = 4096
+    goal_batch_size = 1024 #4096 (previous batch size)
     n_epochs = 16
 
     config_path = os.path.join(output_dir, "config.txt")
@@ -191,6 +192,17 @@ def run(dataset_train, dataset_test, output_dir, downsample=False):
     batch_size_train = min(goal_batch_size, len(dataset_train))
 
     max_batches_per_epoch = sys.maxsize
+
+    if downsample:
+        minority_class_size = int(min(sum(dataset_train.y_data == 0), sum(dataset_train.y_data == 1)))
+        batch_size_train = int(min(goal_batch_size, minority_class_size*2))
+
+        # Force the data loader to stop iterating once the minority class is expected to be fully iterated.
+        # This is mostly just an inconvenience with how PyTorch structures its DataLoader with WeightedRandomSampler
+        # TODO: for future use remove the *2 factor which assumes two (binary) labels
+        max_batches_per_epoch = max(1, ((minority_class_size*2)/batch_size_train) - 1)
+
+    print("Using batch size: ", batch_size_train, "minority_class_size: ", minority_class_size, "max_batches_per_epoch: ", max_batches_per_epoch)
 
     # write the hyperparameters to a file
     with open(config_path, "w") as f:
@@ -206,6 +218,18 @@ def run(dataset_train, dataset_test, output_dir, downsample=False):
             f.write("filter_fn: {}\n".format(str(dataset_train.filter_fn.__name__)))
         else:
             f.write("filter_fn: None\n")
+        f.write("data_conditions: {}\n".format(dataset_train.data_conditions))
+
+    data_loader_train = None
+
+    if downsample:
+        weight_tensor = compute_downsampling_weight_tensor(dataset_train)
+        sampler = torch.utils.data.sampler.WeightedRandomSampler(weight_tensor, len(weight_tensor), replacement=True)
+        data_loader_train = DataLoader(dataset=dataset_train, batch_size=batch_size_train, sampler=sampler)
+    else:
+        data_loader_train = DataLoader(dataset=dataset_train, batch_size=batch_size_train, shuffle=True)
+
+    data_loader_test = DataLoader(dataset=dataset_test, batch_size=len(dataset_test), shuffle=False)
 
     input_size = len(dataset_train[0][0])
     print("using input size: ", input_size)
@@ -215,35 +239,46 @@ def run(dataset_train, dataset_test, output_dir, downsample=False):
     optimizer = optim.SGD(shallow_model.parameters(), lr=learning_rate_base, weight_decay=weight_decay)
 
     # Initialize CLR scheduler
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate_max, steps_per_epoch=dataset_train.get_n_batches_per_epoch(), epochs=n_epochs)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate_max, steps_per_epoch=len([x for x in data_loader_train]), epochs=n_epochs)
 
     # Define the loss function
     loss_fn = nn.BCEWithLogitsLoss()
 
     # Train and get the resulting loss per iteration
-    train_losses, test_losses, test_aucs = train(model=shallow_model, train_loader=dataset_train, test_loader=dataset_test, optimizer=optimizer, scheduler=scheduler, loss_fn=loss_fn, epochs=n_epochs, max_batches_per_epoch=max_batches_per_epoch)
+    train_losses, test_losses, test_aucs = train(model=shallow_model, train_loader=data_loader_train, test_loader=data_loader_test, optimizer=optimizer, scheduler=scheduler, loss_fn=loss_fn, epochs=n_epochs, max_batches_per_epoch=max_batches_per_epoch)
 
     # Test and get the resulting predicted y values
-    shallow_model.eval()    # switch to eval mode to disable dropout
+    shallow_model.eval() # switch to eval mode to disable dropout
 
     return train_losses, test_losses, test_aucs, shallow_model
 
 
 def compute_downsampling_weight_tensor(dataset):
+    target_epoch_size = 50_000
+
     y_data = dataset.y_data
 
     n_total = len(y_data)
     n_true = sum(y_data)
     n_false = n_total - sum(y_data)
     weight_tensor = torch.clone(y_data).detach()
-    # weight = None
+    weight = None
 
-    weight_tensor[weight_tensor == 1] = 1/n_true
-    weight_tensor[weight_tensor == 0] = 1/n_false
+    # compute a weight such that the majority class will be downsampled by that weight to match the minority weight,
+    # and then construct a tensor of weights such that each element of the minority class has weight 1 and each element
+    # of the majority class has weight equal to the downsample weight
+    if n_true < n_false:
+        weight = n_true / n_false
+        weight_tensor[y_data == 0] = weight
+        weight_tensor[y_data == 1] = 1
+    else:
+        weight = n_false / n_true
+        weight_tensor[y_data == 1] = weight
+        weight_tensor[y_data == 0] = 1
 
     expected_epoch_size = float(torch.sum(weight_tensor))
 
-    print("n_true: %d\tn_false: %d\texpected_epoch_size: %d" % (n_true, n_false, expected_epoch_size))
+    print("n_true: %d\tn_false: %d\texpected_epoch_size: %d\tmajority class weight: %d" % (n_true, n_false, expected_epoch_size, weight))
 
     return weight_tensor
 
@@ -330,14 +365,14 @@ def min50bp(record):
         return record.INFO["SVLEN"] >= 50
 
 
-def thread_fn(truth_info_name, annotation_name, train_vcfs, train_contigs, test_vcfs, test_contigs, eval_vcfs, eval_contigs, filter_fn, output_dir):
+def thread_fn(truth_info_name, annotation_name, train_vcfs, train_contigs, test_vcfs, test_contigs, eval_vcfs, eval_contigs, filter_fn, output_dir, data_conditions):
     print("Thread started with ", truth_info_name, annotation_name)
 
     label = truth_info_name + " truth labels and " + annotation_name + " features"
 
-    dataset_train = VcfDataset(vcf_paths=train_vcfs, truth_info_name=truth_info_name, annotation_name=annotation_name, contigs=train_contigs, filter_fn=filter_fn)
-    dataset_test = VcfDataset(vcf_paths=test_vcfs, truth_info_name=truth_info_name, annotation_name=annotation_name, contigs=test_contigs, filter_fn=filter_fn)
-    dataset_eval = VcfDataset(vcf_paths=eval_vcfs, truth_info_name=truth_info_name, annotation_name=annotation_name, contigs=eval_contigs, filter_fn=filter_fn)
+    dataset_train = VcfDatasetBNDs(vcf_paths=train_vcfs, truth_info_name=truth_info_name, annotation_name=annotation_name, contigs=train_contigs, filter_fn=filter_fn, data_conditions=data_conditions, evaluate_complex_bnds=False)
+    dataset_test = VcfDatasetBNDs(vcf_paths=test_vcfs, truth_info_name=truth_info_name, annotation_name=annotation_name, contigs=test_contigs, filter_fn=filter_fn, data_conditions=data_conditions, evaluate_complex_bnds=False)
+    dataset_eval = VcfDatasetBNDs(vcf_paths=eval_vcfs, truth_info_name=truth_info_name, annotation_name=annotation_name, contigs=eval_contigs, filter_fn=filter_fn, data_conditions=data_conditions, evaluate_complex_bnds=data_conditions['evaluate_complex_bnds'])
 
     n_train = len(dataset_train)
     n_test = len(dataset_test)
@@ -358,11 +393,13 @@ def thread_fn(truth_info_name, annotation_name, train_vcfs, train_contigs, test_
     print("Final loss:", sum(train_losses[-100:])/100)
     plot_loss(train_losses=train_losses, test_losses=test_losses, test_aucs=test_aucs, label=label, output_dir=output_dir)
 
+    data_loader_eval = DataLoader(dataset=dataset_eval, batch_size=len(dataset_eval), shuffle=False)
+
     x = dataset_eval.x_data.numpy()
 
     # Finally evaluate on a 3rd dataset which is not used to select training termination conditions
     # Need to use_sigmoid this time to get meaningful 0-1 values
-    y_predict, y_true, mean_loss = test(model=model, loader=dataset_eval, loss_fn=torch.nn.BCELoss(), use_sigmoid=True)
+    y_predict, y_true, mean_loss = test(model=model, loader=data_loader_eval, loss_fn=torch.nn.BCELoss(), use_sigmoid=True)
 
     return dataset_eval.records, x, dataset_eval.feature_indexes, y_true, y_predict, truth_info_name, annotation_name
 
@@ -455,26 +492,29 @@ def write_vcf_config(output_dir, train_vcfs, test_vcfs, eval_vcfs, train_contigs
 
 def main():
     timestamp = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
-    output_dir = os.path.join("output/", timestamp)
+    output_dir = os.path.join("../../output/sv_merge/", timestamp)
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     train_vcfs = [
-        "/Users/rlorigro/data/test_hapestry/vcf/filter_paper/8x/joint/HG00621_joint_calls_multiannotated_by_single_sample_8x_asm10_20bp.vcf.gz",
-        "/Users/rlorigro/data/test_hapestry/vcf/filter_paper/8x/joint/HG01928_joint_calls_multiannotated_by_single_sample_8x_asm10_20bp.vcf.gz",
-        "/Users/rlorigro/data/test_hapestry/vcf/filter_paper/8x/joint/HG02572_joint_calls_multiannotated_by_single_sample_8x_asm10_20bp.vcf.gz",
-        "/Users/rlorigro/data/test_hapestry/vcf/filter_paper/8x/joint/HG03098_joint_calls_multiannotated_by_single_sample_8x_asm10_20bp.vcf.gz",
-        "/Users/rlorigro/data/test_hapestry/vcf/filter_paper/8x/joint/HG03492_joint_calls_multiannotated_by_single_sample_8x_asm10_20bp.vcf.gz",
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG00621.vcf.gz", #00621
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG01928.vcf.gz", #01928
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG02572.vcf.gz", #02572
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG03098.vcf.gz", #03098
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG03492.vcf.gz", #03492
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG002.vcf.gz", #002
+        # "../data/hprc_08x_TEST_5_min_sv_length_2k/HG00438.vcf.gz", #00438
     ]
 
     test_vcfs = [
-        "/Users/rlorigro/data/test_hapestry/vcf/filter_paper/8x/joint/HG00673_joint_calls_multiannotated_by_single_sample_8x_asm10_20bp.vcf.gz",
-        "/Users/rlorigro/data/test_hapestry/vcf/filter_paper/8x/joint/HG00733_joint_calls_multiannotated_by_single_sample_8x_asm10_20bp.vcf.gz",
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG00673.vcf.gz", #00673
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG00733.vcf.gz", #00733
+        # "../data/hprc_08x_TEST_5_min_sv_length_2k/HG005.vcf.gz", #005
     ]
 
     eval_vcfs = [
-        "/Users/rlorigro/data/test_hapestry/vcf/filter_paper/8x/joint/HG03516_joint_calls_multiannotated_by_single_sample_8x_asm10_20bp.vcf.gz",
+        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG03516.vcf.gz", #03516
     ]
 
     train_contigs = {"chr1", "chr2", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr21", "chr22", "chrX"}
@@ -488,8 +528,20 @@ def main():
     # annotation_names = ["Hapestry", "Sniffles"]
 
     # Whether to subset the VCFs to >= 50bp
-    filter_fn = min50bp
-    # filter_fn = None
+    # filter_fn = min50bp
+    filter_fn = None
+
+    # Set data processing conditions
+    data_conditions = {
+    # Setting 'simple_bnds' to False will ignore the the condition of 'evaluate_bnds'
+    'all_bnds' : True, # When set to true, the code will include all types of BNDs (simple and complex) for training, testing, and evaluation datasets. Otherwise, the code will only consider complex BNDs
+    'evaluate_complex_bnds' : True, # When set to true, the code will only evaluate complex BNDs (this only affects evaluation)
+    # Only set one of the following conditions as true at a time
+    'concatenate_bnds' : True, # When set to true, the code will concatenate ID & MATEID data
+    'max_bnds' : False, # When set to true, the code will obtain the maximum of ID & MATEID data
+    'sum_bnds' : False, # When set to true, the code will add the data of ID & MATEID
+    'average_bnds' : False, # When set to true, the code will obtain average the data of ID & MATEID
+    }
 
     # Write a bunch of config files for record keeping
     write_vcf_config(output_dir, train_vcfs, test_vcfs, eval_vcfs, train_contigs, test_contigs, eval_contigs)
@@ -515,7 +567,7 @@ def main():
     # Set up args for multithreading (each combo of truth/label will get its own thread)
     for truth_info_name in truth_info_names:
         for annotation_name in annotation_names:
-            args.append((truth_info_name, annotation_name, train_vcfs, train_contigs, test_vcfs, test_contigs, eval_vcfs, eval_contigs, filter_fn, output_dir))
+            args.append((truth_info_name, annotation_name, train_vcfs, train_contigs, test_vcfs, test_contigs, eval_vcfs, eval_contigs, filter_fn, output_dir, data_conditions))
             length_figs[truth_info_name + "_" + annotation_name] = pyplot.figure(figsize=(10,8))
             length_axes[truth_info_name + "_" + annotation_name] = pyplot.axes()
 
@@ -542,7 +594,7 @@ def main():
                     axes, fpr, tpr, thresholds = plot_roc_curve(y_true=y, y_predict=y_trivial, axes=axes, color=color, label=name, style=':')
 
         tandem_axes = plot_tandem_stratified_roc_curves(tandem_axes, records, y_true, y_predict, truth_info_name, annotation_name)
-        length_axis = plot_length_stratified_roc_curves(length_axis, records, y_true, y_predict, truth_info_name, annotation_name, tandem_only=True)
+        # length_axis = plot_length_stratified_roc_curves(length_axis, records, y_true, y_predict, truth_info_name, annotation_name, tandem_only=True) # BNDs do not have lenght
 
         # write the filtered VCF (BEFORE DOWNSAMPLING)
         write_filtered_vcf(y_predict=y_predict, threshold=0.5, records=records, input_vcf_path=eval_vcfs[0], output_vcf_path=os.path.join(output_dir, label.replace(" ", "_") + ".vcf"))
@@ -568,10 +620,11 @@ def main():
     tandem_axes.legend(loc="lower right", fontsize='small')
     tandem_fig.savefig(os.path.join(output_dir,"roc_curve_tandem_stratified.png"), dpi=200)
 
-    for label,length_axis in length_axes.items():
-        length_axis.plot([0, 1], [0, 1], linestyle='--', label="Random classifier", color="gray")
-        length_axis.legend(loc="lower right", fontsize='small')
-        length_figs[label].savefig(os.path.join(output_dir,label+"_length.png"), dpi=200)
+    # The code below has been commented because BNDs do not have length
+    # for label,length_axis in length_axes.items():
+    #     length_axis.plot([0, 1], [0, 1], linestyle='--', label="Random classifier", color="gray")
+    #     length_axis.legend(loc="lower right", fontsize='small')
+    #     length_figs[label].savefig(os.path.join(output_dir,label+"_length.png"), dpi=200)
 
     for label,(fpr,tpr,thresholds) in roc_data.items():
         with open(os.path.join(output_dir, label.replace(" ", "_") + "_roc.csv"), "w") as f:

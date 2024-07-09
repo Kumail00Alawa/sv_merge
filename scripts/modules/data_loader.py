@@ -3,6 +3,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 import sys
+import time
 
 import vcfpy
 
@@ -22,6 +23,15 @@ def get_type_index(record: vcfpy.Record):
 
 type_names = ["INS","DEL","DUP","NA"]
 
+def feature_length_verification(x, feature_names):
+    if len(x) == 0: # No items were added yet
+        print('ERROR: No vector "x" has not elements.')
+    elif len(feature_names) != len(x[-1]):
+        print(feature_names)
+        print("ERROR: feature names and data length mismatch: names:%d x:%d" % (len(feature_names), len(x[-1])))
+    added_feature_status = True
+    return added_feature_status
+
 
 def load_features_from_vcf(
         records: list,
@@ -31,17 +41,37 @@ def load_features_from_vcf(
         vcf_path: str,
         truth_info_name: str,
         annotation_name: str,
+        data_conditions : dict,
         filter_fn=None,
-        contigs=None):
+        contigs=None,
+        evaluate_complex_bnds=False,
+        ):
+    # For a given record, the features are in the following order: [BND HAPESTRY_READS, Mate of BND HAPESTRY_READS]
+    bnd = dict() # bnd = {ID/MATEID : HAPESTRY_READS + [is_true] + [chrom] + [alt]}
+
+    evaluate_complex_bnds = evaluate_complex_bnds
+
+    all_bnds = data_conditions['all_bnds']
+    concatenate_bnds = data_conditions['concatenate_bnds']
+    max_bnds = data_conditions['max_bnds']
+    sum_bnds = data_conditions['sum_bnds']
+    average_bnds = data_conditions['average_bnds']
+
 
     print(vcf_path)
     reader = vcfpy.Reader.from_path(vcf_path)
 
     type_vector = [0,0,0,0,0]
-
-    r = 0
+    added_feature_status = False
     for record in reader:
+        id = record.ID[0]
+        chrom = record.CHROM[3:]
         info = record.INFO
+        
+        alt = record.ALT[0].__dict__ # Obtain 'ALT' column parameters
+        alt_type = type(record.ALT[0]).__name__
+   
+        hapestry_reads = list(map(float,info["HAPESTRY_READS"]))
 
         if filter_fn is not None:
             if not(filter_fn(record)):
@@ -51,343 +81,308 @@ def load_features_from_vcf(
             if record.CHROM not in contigs:
                 continue
 
-        records.append(record)
-
         if record.calls is None:
             exit("ERROR: no calls in record: " + record.ID)
         elif len(record.calls) != 1:
             exit("ERROR: multiple calls in record: " + record.ID)
 
-        # q = 0, p(correct) <= 0.0  Merged with above
-        # q = 1, p(correct) <= 0.5  Merged with above
-        # q = 2, p(correct) <= 0.75          i = 0 + 1
-        # q = 3, p(correct) <= 0.875         i = 1 + 1
-        # q = 4, p(correct) <= 0.9375        i = 2 + 1
-        # q = 5, p(correct) <= 0.96875       i = 3 + 1
-        # q = 6, p(correct) <= 0.984375      i = 4 + 1
-        # q = 7, p(correct) <= 0.9921875     i = 5 + 1
+        if info['SVTYPE'] != alt['type']:
+            if info['SVTYPE'] == 'INS':
+                if alt['type'] != 'INDEL':
+                    print(f'Warning: BND type in INFO={info["SVTYPE"]} does not match with ALT={alt["type"]}.')
 
-        #                     q F NonSpan       q R NonSpan         q F Span         q R Span        is_tandem
-        #  Window Depth   |                 |                 |                 |                |  /  length of region evaluated
-        #               \  2  3  4  5  6  7  2  3  4  5  6  7  2  3  4  5  6  7  2  3  4  5  6  7  /  /
-        #             i 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26
-        #             [ 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, x]
+            elif info['SVTYPE'] == 'DEL':
+                if alt['type'] != 'SYMBOLIC':
+                    print(f'Warning: BND type in INFO={info["SVTYPE"]} does not match with ALT={alt["type"]}.')
+
+            elif info['SVTYPE'] == 'DUP':
+                if alt['type'] != 'SYMBOLIC':
+                    print(f'Warning: BND type in INFO={info["SVTYPE"]} does not match with ALT={alt["type"]}.')
+
+            elif info['SVTYPE'] == 'INV':
+                if alt['type'] != 'SYMBOLIC':
+                    print(f'Warning: BND type in INFO={info["SVTYPE"]} does not match with ALT={alt["type"]}.')
+
+            else:
+                print(f'Warning: Unknown BND type in INFO={info["SVTYPE"]} paired with ALT={alt["type"]}')
+
+        if all_bnds == True:
+            if evaluate_complex_bnds == True:
+                if alt_type != 'BreakEnd':
+                    continue
+        else:
+            if alt_type != 'BreakEnd':
+                    continue
+
         if truth_info_name.lower() == "hapestry":
             is_true = float(info["HAPESTRY_REF_MAX"]) > 0.9
         elif truth_info_name is not None:
             if truth_info_name not in info:
                 sys.stderr.write("ERROR: truth info not found in record: " + str(record.ID) + "\n")
                 continue
-
             is_true = info[truth_info_name]
         else:
             is_true = 0
 
-        ref_length = float(len(record.REF))
-        alt_length = float(len(record.ALT[0].serialize()))
+        # Record does not have a MATEID. Concatenate ID data and set zeros for MATEID data. The following part is for simple events and single BNDs
+        if alt_type != 'BreakEnd':
 
-        is_tandem = info["tr_coverage"] > 0.9
+            # Append a list that will be populated with data
+            x.append([])
+            # Make the missing record as an array of zeros
+            if 'mate_of_' not in id:
+                if concatenate_bnds:
+                    # Add the hapestry features for the ID records
+                    x[-1].extend(hapestry_reads)
+                    # Add a list of zeros for the mate records
+                    x[-1].extend([0] * len(hapestry_reads))
+                elif max_bnds or sum_bnds:
+                    x[-1].extend(hapestry_reads)
+                elif average_bnds:
+                    x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(hapestry_reads, [0]*len(hapestry_reads))])
+            else:
+                if concatenate_bnds:
+                    # Add a list of zeros for the ID records
+                    x[-1].extend([0] * len(hapestry_reads))
+                    # Add the hapestry features for the mate records
+                    x[-1].extend(hapestry_reads)
+                elif max_bnds or sum_bnds:
+                    x[-1].extend(hapestry_reads)
+                elif average_bnds:
+                    x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(hapestry_reads, [0]*len(hapestry_reads))])
 
-        t = type_vector
-        type_index = get_type_index(record)
-        t[type_index] = 1
+            x[-1].extend([0,0,1]) # Add BND_Connection information (single breakend)
 
-        caller_support = [0,0,0]
-        caller_support[0] = info["SUPP_PAV"] if "SUPP_PAV" in info else 0
-        caller_support[1] = info["SUPP_PBSV"] if "SUPP_PBSV" in info else 0
-        caller_support[2] = info["SUPP_SNIFFLES"] if "SUPP_SNIFFLES" in info else 0
+            
+            if alt_type == 'SingleBreakEnd':
+                # Single BNDs
+                if alt['mate_orientation'] == None:
+                    if alt['orientation'] == '+':
+                        x[-1].extend([1,0,1,0])
+                    elif alt['orientation'] == '-':
+                        x[-1].extend([1,0,0,0])
+                    else:
+                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a single BND. Record ID: {id}')
+                elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
+                    print(f'Error: Unexpected to see a "mate_orientation={alt["mate_orientation"]}" for a single BND. Considering the BND as single BND. Record ID: {id}')
+                    # Ignoring mate_orientation, and considering it as a single BND
+                    if alt['orientation'] == '+':
+                        x[-1].extend([1,0,1,0])
+                    elif alt['orientation'] == '-':
+                        x[-1].extend([1,0,0,0])
+                    else:
+                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a single BND. Record ID: {id}')
+                else:
+                    print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a single BND. Record ID: {id}')
+            else:
+                # For simple events
+                x[-1].extend([0,0,0,0])
+            y.append(is_true)
+            records.append(record)
+            if added_feature_status == False:
+                feature_names.extend(["hapestry_data_" + str(i) for i in range(2*len(hapestry_reads)+len([0]*7) if concatenate_bnds else len(hapestry_reads)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
+                added_feature_status = feature_length_verification(x, feature_names)
+            continue
 
-        hapestry_data = list(map(float,info["HAPESTRY_READS"]))
+        mate_id = info['MATEID'][0]
 
-        y.append(is_true)
+        if 'mate_of_' not in id:
+            # Concatenate data if MATEID was found before
+            if mate_id not in bnd:
+                # If mate was not found before, save data until it is found
+                bnd[id] = hapestry_reads + [is_true] + [chrom] + [alt] # Concatenate the lists
+                
+            else:
+                alt = bnd[mate_id].pop(-1)
+
+                # Obtain the chrom pair no.
+                chrom_pair = bnd[mate_id].pop(-1)
+
+                # Obtain the maximum of the is_true values of both, ID and MATEID:
+                is_true_max = max(bnd[mate_id].pop(-1), is_true)
+
+                # Append a list that will be populated with data
+                x.append([])
+
+                if concatenate_bnds:
+                    # Populate the list with data
+                    x[-1].extend(hapestry_reads)
+                    x[-1].extend(bnd[mate_id])
+                elif max_bnds:
+                    x[-1].extend(list(np.maximum(np.array(hapestry_reads), np.array(bnd[mate_id]))))
+                elif sum_bnds:
+                    x[-1].extend([sum(x) for x in zip(hapestry_reads, bnd[mate_id])])
+                elif average_bnds:
+                    x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(hapestry_reads, bnd[mate_id])])
+
+                if chrom == chrom_pair:
+                    x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
+                
+                else:
+                    x[-1].extend([0,1,0]) # Add BND_Connection information (inter breakend)
+
+                if alt['mate_orientation'] == None:
+                    # This part should account for Telomeres
+                    if alt['orientation'] == '+':
+                        x[-1].extend([1,0,1,0])
+                    elif alt['orientation'] == '-':
+                        x[-1].extend([1,0,0,0])
+                    else:
+                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
+                elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
+                    if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
+                        x[-1].extend([1,1,1,1])
+                    elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
+                        x[-1].extend([1,1,1,0])
+                    elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
+                        x[-1].extend([1,1,0,1])
+                    elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
+                        x[-1].extend([1,1,0,0])
+                    else:
+                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
+                else:
+                    print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a BND. Record ID: {id}')
+                y.append(is_true_max)
+                records.append(record)
+                if added_feature_status == False:
+                    feature_names.extend(["hapestry_data_" + str(i) for i in range(len(hapestry_reads + bnd[mate_id])+len([0]*7) if concatenate_bnds else len(hapestry_reads)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
+                    added_feature_status = feature_length_verification(x, feature_names)
+                del bnd[mate_id] # remove to save RAM
+
+
+        else:
+            # Concatenate data if ID exists previously. 'mate_id' does not have "mate_of_" due to previous 'if statement' 
+            if mate_id not in bnd:
+                # If ID  was not found before, save data until it is found
+                bnd[id] = hapestry_reads + [is_true] + [chrom] + [alt] # Concatenate the lists
+            else:
+                alt = bnd[mate_id].pop(-1)
+
+                # Obtain the chrom pair no.
+                chrom_pair = bnd[mate_id].pop(-1)
+
+                # Obtain the maximum of the is_true values of both, ID and MATEID:
+                is_true_max = max(bnd[mate_id].pop(-1), is_true)
+
+                # Append a list that will be populated with data
+                x.append([])
+                if concatenate_bnds:
+                    # Populate the list with data
+                    x[-1].extend(bnd[mate_id])
+                    x[-1].extend(hapestry_reads)
+                elif max_bnds:
+                    x[-1].extend(list(np.maximum(np.array(hapestry_reads), np.array(bnd[mate_id]))))
+                elif sum_bnds:
+                    x[-1].extend([sum(x) for x in zip(hapestry_reads, bnd[mate_id])])
+                elif average_bnds:
+                    x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(hapestry_reads, bnd[mate_id])])
+
+                if chrom == chrom_pair:
+                    x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
+                
+                else:
+                    x[-1].extend([0,1,0]) # Add BND_Connection information (inter breakend)
+
+                if alt['mate_orientation'] == None:
+                    # This part should account for Telomeres
+                    if alt['orientation'] == '+':
+                        x[-1].extend([1,0,1,0])
+                    elif alt['orientation'] == '-':
+                        x[-1].extend([1,0,0,0])
+                    else:
+                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
+                elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
+                    if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
+                        x[-1].extend([1,1,1,1])
+                    elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
+                        x[-1].extend([1,1,1,0])
+                    elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
+                        x[-1].extend([1,1,0,1])
+                    elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
+                        x[-1].extend([1,1,0,0])
+                    else:
+                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
+                else:
+                    print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a BND. Record ID: {id}')
+                
+                y.append(is_true_max)
+                records.append(record)
+                if added_feature_status == False:
+                    feature_names.extend(["hapestry_data_" + str(i) for i in range(len(bnd[mate_id] + hapestry_reads)+len([0]*7) if concatenate_bnds else len(hapestry_reads)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
+                    added_feature_status = feature_length_verification(x, feature_names)        
+                del bnd[mate_id] # remove to save RAM
+
+    # 'identifier' is the key, and 'data' is the value
+    for indentifier, data in bnd.items():
+        alt = data.pop(-1)
+
+        # Obtain the chrom pair no.
+        chrom_pair = data.pop(-1)
+
+        # ID as identifier
+        # Obtain the is_true value of ID:
+        is_true = data.pop(-1)
+
+        # Append a list that will be populated with data
         x.append([])
 
-        q_score = record.QUAL if record.QUAL is not None else 0
-        stdev_pos = float(info["STDEV_POS"]) if "STDEV_POS" in info else 0
-        stdev_len = float(info["STDEV_LEN"]) if "STDEV_LEN" in info else 0
-
-
-        x[-1].append(q_score)
-        if r == 0:
-            feature_names.append("q_score")
-
-        x[-1].append(stdev_len)
-        if r == 0:
-            feature_names.append("stdev_len")
-
-        x[-1].append(stdev_pos)
-        if r == 0:
-            feature_names.append("stdev_pos")
-
-        x[-1].append(ref_length)
-        if r == 0:
-            feature_names.append("ref_length")
-
-        x[-1].append(alt_length)
-        if r == 0:
-            feature_names.append("alt_length")
-
-        x[-1].extend(type_vector)
-        if r == 0:
-            feature_names.extend(["type_" + str(i) for i in range(len(type_vector))])
-
-        x[-1].extend(caller_support)
-        if r == 0:
-            feature_names.extend(["caller_support_" + str(i) for i in range(len(caller_support))])
-
-        if annotation_name.lower() == "hapestry":
-            max_align_score = info["HAPESTRY_READS_MAX"]
-
-            x[-1].extend(hapestry_data)
-            if r == 0:
-                feature_names.extend(["hapestry_data_" + str(i) for i in range(len(hapestry_data))])
-
-            x[-1].append(max_align_score)
-            if r == 0:
-                feature_names.append("max_align_score")
-
-        elif annotation_name.lower() == "sniffles":
-            call = record.calls[0]
-
-            gt = list(map(float,call.data["GT"].replace('.','0').split("/"))) if '/' in call.data["GT"] else [0,0]
-
-            x[-1].extend(gt)
-            if r == 0:
-                feature_names.extend(["GT_" + str(i) for i in range(len(gt))])
-
-            x[-1].append(call.data["GQ"])
-            if r == 0:
-                feature_names.append("GQ")
-
-            x[-1].append(call.data["DR"])
-            if r == 0:
-                feature_names.append("DR")
-
-            x[-1].append(call.data["DV"])
-            if r == 0:
-                feature_names.append("DV")
-
-            x[-1].append(is_tandem)
-            if r == 0:
-                feature_names.append("is_tandem")
-
-        elif annotation_name.lower() == "svjedi":
-            call = record.calls[0]
-
-            pl = call.data["PL"] if None not in call.data["PL"] else [0,0,0]
-            # Sort GT because we don't care about order, just want consistency for the model
-            gt = sorted(list(map(float,call.data["GT"].split("|"))) if '|' in call.data["GT"] else [0,0])
-
-            x[-1].extend(gt)
-            if r == 0:
-                feature_names.extend(["GT_" + str(i) for i in range(len(gt))])
-
-            x[-1].extend(call.data["AD"])
-            if r == 0:
-                feature_names.extend(["AD_" + str(i) for i in range(len(call.data["AD"]))])
-
-            x[-1].append(call.data["DP"])
-            if r == 0:
-                feature_names.append("DP")
-
-            x[-1].extend(pl)
-            if r == 0:
-                feature_names.extend(["PL_" + str(i) for i in range(len(pl))])
-
-            x[-1].append(is_tandem)
-            if r == 0:
-                feature_names.append("is_tandem")
-
-        elif annotation_name.lower() == "kanpig":
-            call = record.calls[0]
-
-            # Sort GT because we don't care about order, just want consistency for the model
-            gt = sorted(list(map(float,call.data["GT"].split("|"))) if '|' in call.data["GT"] else [0,0])
-
-            x[-1].extend(gt)
-            if r == 0:
-                feature_names.extend(["GT_" + str(i) for i in range(len(gt))])
-
-            x[-1].extend(call.data["AD"])
-            if r == 0:
-                feature_names.extend(["AD_" + str(i) for i in range(len(call.data["AD"]))])
-
-            x[-1].append(call.data["DP"])
-            if r == 0:
-                feature_names.append("DP")
-
-            x[-1].append(call.data["GQ"])
-            if r == 0:
-                feature_names.append("GQ")
-
-            x[-1].append(call.data["SQ"])
-            if r == 0:
-                feature_names.append("SQ")
-
-            x[-1].append(is_tandem)
-            if r == 0:
-                feature_names.append("is_tandem")
-
-        elif annotation_name.lower() == "cutesv":
-            call = record.calls[0]
-
-            # Sort GT because we don't care about order, just want consistency for the model
-            gt = sorted(list(map(float,call.data["GT"].split("|"))) if '|' in call.data["GT"] else [0,0])
-
-            x[-1].extend(gt)
-            if r == 0:
-                feature_names.extend(["GT_" + str(i) for i in range(len(gt))])
-
-            x[-1].append(call.data["GQ"])
-            if r == 0:
-                feature_names.append("GQ")
-
-            x[-1].append(call.data["DR"])
-            if r == 0:
-                feature_names.append("DR")
-
-            x[-1].append(call.data["DV"])
-            if r == 0:
-                feature_names.append("DV")
-
-            x[-1].extend(call.data["PL"])
-            if r == 0:
-                feature_names.extend(["PL_" + str(i) for i in range(len(call.data["PL"]))])
-
-            x[-1].append(is_tandem)
-            if r == 0:
-                feature_names.append("is_tandem")
-
-            if r == 0:
-                print("GQ", call.data["GQ"])
-                print("DR", call.data["DR"])
-                print("DV", call.data["DV"])
-                print("PL", call.data["PL"])
-
-        elif annotation_name.lower() == "lrcaller":
-            call = record.calls[0]
-
-            gt1 = sorted(list(map(float,call.data["GT1"].split("/"))) if '/' in call.data["GT1"] else [0,0])
-            gt2 = sorted(list(map(float,call.data["GT2"].split("/"))) if '/' in call.data["GT2"] else [0,0])
-            gt3 = sorted(list(map(float,call.data["GT3"].split("/"))) if '/' in call.data["GT3"] else [0,0])
-            gt4 = sorted(list(map(float,call.data["GT4"].split("/"))) if '/' in call.data["GT4"] else [0,0])
-            gt5 = sorted(list(map(float,call.data["GT5"].split("/"))) if '/' in call.data["GT5"] else [0,0])
-
-            x[-1].extend(gt1)
-            if r == 0:
-                feature_names.extend(["GT1_" + str(i) for i in range(len(gt1))])
-
-            x[-1].extend(gt2)
-            if r == 0:
-                feature_names.extend(["GT2_" + str(i) for i in range(len(gt1))])
-
-            x[-1].extend(gt3)
-            if r == 0:
-                feature_names.extend(["GT3_" + str(i) for i in range(len(gt1))])
-
-            x[-1].extend(gt4)
-            if r == 0:
-                feature_names.extend(["GT4_" + str(i) for i in range(len(gt1))])
-
-            x[-1].extend(gt5)
-            if r == 0:
-                feature_names.extend(["GT5_" + str(i) for i in range(len(gt1))])
-
-            x[-1].extend(call.data["AD1"])
-            if r == 0:
-                feature_names.extend(["AD1_" + str(i) for i in range(len(call.data["AD1"]))])
-
-            x[-1].extend(call.data["AD2"])
-            if r == 0:
-                feature_names.extend(["AD2_" + str(i) for i in range(len(call.data["AD2"]))])
-
-            x[-1].extend(call.data["AD3"])
-            if r == 0:
-                feature_names.extend(["AD3_" + str(i) for i in range(len(call.data["AD3"]))])
-
-            x[-1].extend(call.data["AD4"])
-            if r == 0:
-                feature_names.extend(["AD4_" + str(i) for i in range(len(call.data["AD4"]))])
-
-            x[-1].extend(call.data["AD5"])
-            if r == 0:
-                feature_names.extend(["AD5_" + str(i) for i in range(len(call.data["AD5"]))])
-
-            x[-1].extend(call.data["VA1"])
-            if r == 0:
-                feature_names.extend(["VA1_" + str(i) for i in range(len(call.data["VA1"]))])
-
-            x[-1].extend(call.data["VA2"])
-            if r == 0:
-                feature_names.extend(["VA2_" + str(i) for i in range(len(call.data["VA2"]))])
-
-            x[-1].extend(call.data["VA3"])
-            if r == 0:
-                feature_names.extend(["VA3_" + str(i) for i in range(len(call.data["VA3"]))])
-
-            x[-1].extend(call.data["VA4"])
-            if r == 0:
-                feature_names.extend(["VA4_" + str(i) for i in range(len(call.data["VA4"]))])
-
-            x[-1].extend(call.data["VA5"])
-            if r == 0:
-                feature_names.extend(["VA5_" + str(i) for i in range(len(call.data["VA5"]))])
-
-            x[-1].extend(call.data["PL1"])
-            if r == 0:
-                feature_names.extend(["PL1_" + str(i) for i in range(len(call.data["PL1"]))])
-
-            x[-1].extend(call.data["PL2"])
-            if r == 0:
-                feature_names.extend(["PL2_" + str(i) for i in range(len(call.data["PL2"]))])
-
-            x[-1].extend(call.data["PL3"])
-            if r == 0:
-                feature_names.extend(["PL3_" + str(i) for i in range(len(call.data["PL3"]))])
-
-            x[-1].extend(call.data["PL4"])
-            if r == 0:
-                feature_names.extend(["PL4_" + str(i) for i in range(len(call.data["PL4"]))])
-
-            x[-1].extend(call.data["PL5"])
-            if r == 0:
-                feature_names.extend(["PL5_" + str(i) for i in range(len(call.data["PL5"]))])
-
-            x[-1].append(is_tandem)
-            if r == 0:
-                feature_names.append("is_tandem")
-                print("GT1",call.data["GT1"])
-                print("GT2",call.data["GT2"])
-                print("GT3",call.data["GT3"])
-                print("GT4",call.data["GT4"])
-                print("GT5",call.data["GT5"])
-                print("AD1",call.data["AD1"])
-                print("AD2",call.data["AD2"])
-                print("AD3",call.data["AD3"])
-                print("AD4",call.data["AD4"])
-                print("AD5",call.data["AD5"])
-                print("VA1",call.data["VA1"])
-                print("VA2",call.data["VA2"])
-                print("VA3",call.data["VA3"])
-                print("VA4",call.data["VA4"])
-                print("VA5",call.data["VA5"])
-                print("PL1",call.data["PL1"])
-                print("PL2",call.data["PL2"])
-                print("PL3",call.data["PL3"])
-                print("PL4",call.data["PL4"])
-                print("PL5",call.data["PL5"])
-                print(x[-1])
-
-        if r == 0:
-            if len(feature_names) != len(x[-1]):
-                print(feature_names)
-                print("ERROR: feature names and data length mismatch: names:%d x:%d" % (len(feature_names), len(x[-1])))
-
-        r += 1
-
-
-class VcfDataset(Dataset):
-    def __init__(self, vcf_paths: list, truth_info_name, annotation_name, batch_size=256, filter_fn=None, contigs=None):
+        if concatenate_bnds:
+            # Add a list of zeros for the ID records
+            x[-1].extend(data)
+            
+            # Add the hapestry features for the mate records
+            x[-1].extend(data) 
+        elif max_bnds:
+            x[-1].extend(data)
+        elif sum_bnds:
+            x[-1].extend([(e1 + e2) for e1, e2 in zip(data, data)])
+        elif average_bnds:
+            x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(data, data)])
+
+        x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
+
+        # We are considering any BNDs that do not have mates as copies of the found BNDs
+        if alt['mate_orientation'] == None:
+            # This part should account for Telomeres
+            if alt['orientation'] == '+':
+                x[-1].extend([1,0,1,0])
+            elif alt['orientation'] == '-':
+                x[-1].extend([1,0,0,0])
+            else:
+                print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
+        elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
+            print(f'Warning: Seen a "mate_orientation={alt["mate_orientation"]}" for a BND, but mate was not found. Considering the mate of BND as a copy of the found BND. Record ID: {indentifier}')
+
+            if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
+                x[-1].extend([1,1,1,1])
+            elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
+                x[-1].extend([1,1,1,0])
+            elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
+                x[-1].extend([1,1,0,1])
+            elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
+                x[-1].extend([1,1,0,0])
+            else:
+                print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
+        else:
+            print(f'Error: Unexpected "mate_orientation={alt["mate_orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
+        
+        y.append(is_true)
+        records.append(record)
+        if added_feature_status == False:
+            feature_names.extend(["hapestry_data_" + str(i) for i in range(2*len(data)+len([0]*7) if concatenate_bnds else len(data)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
+            added_feature_status = feature_length_verification(x, feature_names)     
+
+
+class VcfDatasetBNDs(Dataset):
+    def __init__(self, 
+                 vcf_paths: list, 
+                 truth_info_name, 
+                 annotation_name, 
+                 data_conditions,
+                 filter_fn=None, 
+                 contigs=None, 
+                 evaluate_complex_bnds=False, 
+                 ):
         x = list()
         y = list()
 
@@ -410,6 +405,8 @@ class VcfDataset(Dataset):
                 annotation_name=annotation_name,
                 filter_fn=filter_fn,
                 contigs=contigs,
+                evaluate_complex_bnds=evaluate_complex_bnds,
+                data_conditions=data_conditions,
             )
 
             self.feature_indexes = {feature_names[i]: i for i in range(len(feature_names))}
@@ -429,25 +426,8 @@ class VcfDataset(Dataset):
         self.x_data += 1e-12
 
         self.filter_fn = filter_fn
-
-        self.minority_size = self.compute_minority_size()
-
-        self.ordinals = list(range(self.length))
-
-        self.batch_size = batch_size
-        self.subset_ordinals = list()
-        self.initialize_iterator()
-
-    def set_batch_size(self, batch_size):
-        self.batch_size = batch_size
-
-    def compute_minority_size(self):
-        unique, counts = np.unique(self.y_data.numpy(), return_counts=True)
-
-        return min(counts)
-
-    def get_n_batches_per_epoch(self):
-        return len(self.subset_ordinals) // self.batch_size
+        self.evaluate_complex_bnds = evaluate_complex_bnds
+        self.data_conditions = data_conditions
 
     def __getitem__(self, index):
         return self.x_data[index], self.y_data[index]
@@ -455,48 +435,3 @@ class VcfDataset(Dataset):
     def __len__(self):
         return self.length
 
-    def initialize_iterator(self):
-        # Shuffle and iterate over the data, accumulating approximately balanced batches without replacement
-        np.random.shuffle(self.ordinals)
-
-        self.subset_ordinals = list()
-        accumulated_class_counts = defaultdict(int)
-
-        for i in self.ordinals:
-            c = self.y_data[i].item()
-
-            if accumulated_class_counts[c] < self.minority_size:
-                self.subset_ordinals.append(i)
-                accumulated_class_counts[c] += 1
-
-        np.random.shuffle(self.subset_ordinals)
-
-    def iter_balanced_batches(self, max_batches_per_epoch=sys.maxsize):
-        n = 0
-        i = 0
-        while i + self.batch_size < len(self.subset_ordinals):
-            if n >= max_batches_per_epoch:
-                break
-
-            batch_indexes = self.subset_ordinals[i:i+self.batch_size]
-
-            yield self.x_data[batch_indexes], self.y_data[batch_indexes]
-
-            i += self.batch_size
-            n += 1
-
-        self.initialize_iterator()
-
-    def iter_batches(self, max_batches_per_epoch=sys.maxsize):
-        n = 0
-        i = 0
-        m = 0
-        while m < self.length - 1:
-            if n >= max_batches_per_epoch:
-                break
-
-            m = min(i+self.batch_size, self.length)
-            yield self.x_data[i:m], self.y_data[i:m]
-
-            i += self.batch_size
-            n += 1
