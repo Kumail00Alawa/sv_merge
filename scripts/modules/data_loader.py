@@ -56,6 +56,7 @@ def load_features_from_vcf(
     max_bnds = data_conditions['max_bnds']
     sum_bnds = data_conditions['sum_bnds']
     average_bnds = data_conditions['average_bnds']
+    features = data_conditions['features']
 
 
     print(vcf_path)
@@ -151,36 +152,53 @@ def load_features_from_vcf(
                 elif average_bnds:
                     x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(hapestry_reads, [0]*len(hapestry_reads))])
 
-            x[-1].extend([0,0,1]) # Add BND_Connection information (single breakend)
+            if features:
+                x[-1].extend([0,0,1]) # Add BND_Connection information (single breakend)
 
-            
-            if alt_type == 'SingleBreakEnd':
-                # Single BNDs
-                if alt['mate_orientation'] == None:
-                    if alt['orientation'] == '+':
-                        x[-1].extend([1,0,1,0])
-                    elif alt['orientation'] == '-':
-                        x[-1].extend([1,0,0,0])
+                
+                if alt_type == 'SingleBreakEnd':
+                    # Single BNDs
+                    if alt['mate_orientation'] == None:
+                        if alt['orientation'] == '+':
+                            x[-1].extend([1,0,1,0])
+                        elif alt['orientation'] == '-':
+                            x[-1].extend([1,0,0,0])
+                        else:
+                            print(f'Error: Unexpected "orientation={alt["orientation"]}" for a single BND. Record ID: {id}')
+                    elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
+                        print(f'Error: Unexpected to see a "mate_orientation={alt["mate_orientation"]}" for a single BND. Considering the BND as single BND. Record ID: {id}')
+                        # Ignoring mate_orientation, and considering it as a single BND
+                        if alt['orientation'] == '+':
+                            x[-1].extend([1,0,1,0])
+                        elif alt['orientation'] == '-':
+                            x[-1].extend([1,0,0,0])
+                        else:
+                            print(f'Error: Unexpected "orientation={alt["orientation"]}" for a single BND. Record ID: {id}')
                     else:
-                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a single BND. Record ID: {id}')
-                elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
-                    print(f'Error: Unexpected to see a "mate_orientation={alt["mate_orientation"]}" for a single BND. Considering the BND as single BND. Record ID: {id}')
-                    # Ignoring mate_orientation, and considering it as a single BND
-                    if alt['orientation'] == '+':
-                        x[-1].extend([1,0,1,0])
-                    elif alt['orientation'] == '-':
-                        x[-1].extend([1,0,0,0])
-                    else:
-                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a single BND. Record ID: {id}')
+                        print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a single BND. Record ID: {id}')
                 else:
-                    print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a single BND. Record ID: {id}')
-            else:
-                # For simple events
-                x[-1].extend([0,0,0,0])
+                    # For simple events
+                    x[-1].extend([0,0,0,0])
             y.append(is_true)
             records.append(record)
             if added_feature_status == False:
-                feature_names.extend(["hapestry_data_" + str(i) for i in range(2*len(hapestry_reads)+len([0]*7) if concatenate_bnds else len(hapestry_reads)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
+                if features:
+                    if concatenate_bnds:
+                        hap_range = 2*len(hapestry_reads)+len([0]*7)
+                    elif max_bnds or sum_bnds or average_bnds:
+                        hap_range = len(hapestry_reads)+len([0]*7)
+                    else:
+                        print('Error line 191')
+
+                else:
+                    if concatenate_bnds:
+                        hap_range = 2*len(hapestry_reads)#+len([0]*7)
+                    elif max_bnds or sum_bnds or average_bnds:
+                        hap_range = len(hapestry_reads)#+len([0]*7)
+                    else:
+                        print('Error line 191')
+
+                feature_names.extend(["hapestry_data_" + str(i) for i in range(hap_range)])
                 added_feature_status = feature_length_verification(x, feature_names)
             continue
 
@@ -215,37 +233,55 @@ def load_features_from_vcf(
                 elif average_bnds:
                     x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(hapestry_reads, bnd[mate_id])])
 
-                if chrom == chrom_pair:
-                    x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
-                
-                else:
-                    x[-1].extend([0,1,0]) # Add BND_Connection information (inter breakend)
+                if features:
+                    if chrom == chrom_pair:
+                        x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
+                    
+                    else:
+                        x[-1].extend([0,1,0]) # Add BND_Connection information (inter breakend)
 
-                if alt['mate_orientation'] == None:
-                    # This part should account for Telomeres
-                    if alt['orientation'] == '+':
-                        x[-1].extend([1,0,1,0])
-                    elif alt['orientation'] == '-':
-                        x[-1].extend([1,0,0,0])
+                    if alt['mate_orientation'] == None:
+                        # This part should account for Telomeres
+                        if alt['orientation'] == '+':
+                            x[-1].extend([1,0,1,0])
+                        elif alt['orientation'] == '-':
+                            x[-1].extend([1,0,0,0])
+                        else:
+                            print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
+                    elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
+                        if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
+                            x[-1].extend([1,1,1,1])
+                        elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
+                            x[-1].extend([1,1,1,0])
+                        elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
+                            x[-1].extend([1,1,0,1])
+                        elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
+                            x[-1].extend([1,1,0,0])
+                        else:
+                            print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
                     else:
-                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
-                elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
-                    if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
-                        x[-1].extend([1,1,1,1])
-                    elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
-                        x[-1].extend([1,1,1,0])
-                    elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
-                        x[-1].extend([1,1,0,1])
-                    elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
-                        x[-1].extend([1,1,0,0])
-                    else:
-                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
-                else:
-                    print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a BND. Record ID: {id}')
+                        print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a BND. Record ID: {id}')
                 y.append(is_true_max)
                 records.append(record)
                 if added_feature_status == False:
-                    feature_names.extend(["hapestry_data_" + str(i) for i in range(len(hapestry_reads + bnd[mate_id])+len([0]*7) if concatenate_bnds else len(hapestry_reads)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
+                    if features:
+                        if concatenate_bnds:
+                            hap_range = 2*len(hapestry_reads)+len([0]*7)
+                        elif max_bnds or sum_bnds or average_bnds:
+                            hap_range = len(hapestry_reads)+len([0]*7)
+                        else:
+                            print('Error line 191')
+
+                    else:
+                        if concatenate_bnds:
+                            hap_range = 2*len(hapestry_reads)#+len([0]*7)
+                        elif max_bnds or sum_bnds or average_bnds:
+                            hap_range = len(hapestry_reads)#+len([0]*7)
+                        else:
+                            print('Error line 191')
+
+                    feature_names.extend(["hapestry_data_" + str(i) for i in range(hap_range)])
+                    # feature_names.extend(["hapestry_data_" + str(i) for i in range(len(hapestry_reads + bnd[mate_id])+len([0]*7) if concatenate_bnds else len(hapestry_reads)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
                     added_feature_status = feature_length_verification(x, feature_names)
                 del bnd[mate_id] # remove to save RAM
 
@@ -277,38 +313,56 @@ def load_features_from_vcf(
                 elif average_bnds:
                     x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(hapestry_reads, bnd[mate_id])])
 
-                if chrom == chrom_pair:
-                    x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
-                
-                else:
-                    x[-1].extend([0,1,0]) # Add BND_Connection information (inter breakend)
+                if features:
+                    if chrom == chrom_pair:
+                        x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
+                    
+                    else:
+                        x[-1].extend([0,1,0]) # Add BND_Connection information (inter breakend)
 
-                if alt['mate_orientation'] == None:
-                    # This part should account for Telomeres
-                    if alt['orientation'] == '+':
-                        x[-1].extend([1,0,1,0])
-                    elif alt['orientation'] == '-':
-                        x[-1].extend([1,0,0,0])
+                    if alt['mate_orientation'] == None:
+                        # This part should account for Telomeres
+                        if alt['orientation'] == '+':
+                            x[-1].extend([1,0,1,0])
+                        elif alt['orientation'] == '-':
+                            x[-1].extend([1,0,0,0])
+                        else:
+                            print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
+                    elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
+                        if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
+                            x[-1].extend([1,1,1,1])
+                        elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
+                            x[-1].extend([1,1,1,0])
+                        elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
+                            x[-1].extend([1,1,0,1])
+                        elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
+                            x[-1].extend([1,1,0,0])
+                        else:
+                            print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
                     else:
-                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
-                elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
-                    if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
-                        x[-1].extend([1,1,1,1])
-                    elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
-                        x[-1].extend([1,1,1,0])
-                    elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
-                        x[-1].extend([1,1,0,1])
-                    elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
-                        x[-1].extend([1,1,0,0])
-                    else:
-                        print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND. Record ID: {id}')
-                else:
-                    print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a BND. Record ID: {id}')
+                        print(f'Error: Unexpected "mate_orientation"={alt["mate_orientation"]} for a BND. Record ID: {id}')
                 
                 y.append(is_true_max)
                 records.append(record)
                 if added_feature_status == False:
-                    feature_names.extend(["hapestry_data_" + str(i) for i in range(len(bnd[mate_id] + hapestry_reads)+len([0]*7) if concatenate_bnds else len(hapestry_reads)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
+                    if features:
+                        if concatenate_bnds:
+                            hap_range = 2*len(hapestry_reads)+len([0]*7)
+                        elif max_bnds or sum_bnds or average_bnds:
+                            hap_range = len(hapestry_reads)+len([0]*7)
+                        else:
+                            print('Error line 191')
+
+                    else:
+                        if concatenate_bnds:
+                            hap_range = 2*len(hapestry_reads)#+len([0]*7)
+                        elif max_bnds or sum_bnds or average_bnds:
+                            hap_range = len(hapestry_reads)#+len([0]*7)
+                        else:
+                            print('Error line 191')
+
+                    feature_names.extend(["hapestry_data_" + str(i) for i in range(hap_range)])
+                    # feature_names.extend(["hapestry_data_" + str(i) for i in range(len(bnd[mate_id] + hapestry_reads)+len([0]*7) if concatenate_bnds else len(hapestry_reads)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
                     added_feature_status = feature_length_verification(x, feature_names)        
                 del bnd[mate_id] # remove to save RAM
 
@@ -339,37 +393,55 @@ def load_features_from_vcf(
         elif average_bnds:
             x[-1].extend([(e1 + e2) / 2 for e1, e2 in zip(data, data)])
 
-        x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
+        if features:
+            x[-1].extend([1,0,0]) # Add BND_Connection information (intra breakend)
 
-        # We are considering any BNDs that do not have mates as copies of the found BNDs
-        if alt['mate_orientation'] == None:
-            # This part should account for Telomeres
-            if alt['orientation'] == '+':
-                x[-1].extend([1,0,1,0])
-            elif alt['orientation'] == '-':
-                x[-1].extend([1,0,0,0])
-            else:
-                print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
-        elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
-            print(f'Warning: Seen a "mate_orientation={alt["mate_orientation"]}" for a BND, but mate was not found. Considering the mate of BND as a copy of the found BND. Record ID: {indentifier}')
+            # We are considering any BNDs that do not have mates as copies of the found BNDs
+            if alt['mate_orientation'] == None:
+                # This part should account for Telomeres
+                if alt['orientation'] == '+':
+                    x[-1].extend([1,0,1,0])
+                elif alt['orientation'] == '-':
+                    x[-1].extend([1,0,0,0])
+                else:
+                    print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
+            elif alt['mate_orientation'] == '+' or alt['mate_orientation'] == '-':
+                print(f'Warning: Seen a "mate_orientation={alt["mate_orientation"]}" for a BND, but mate was not found. Considering the mate of BND as a copy of the found BND. Record ID: {indentifier}')
 
-            if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
-                x[-1].extend([1,1,1,1])
-            elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
-                x[-1].extend([1,1,1,0])
-            elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
-                x[-1].extend([1,1,0,1])
-            elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
-                x[-1].extend([1,1,0,0])
+                if alt['orientation'] == '+' and alt['mate_orientation'] == '+':
+                    x[-1].extend([1,1,1,1])
+                elif alt['orientation'] == '+' and alt['mate_orientation'] == '-':
+                    x[-1].extend([1,1,1,0])
+                elif alt['orientation'] == '-' and alt['mate_orientation'] == '+':
+                    x[-1].extend([1,1,0,1])
+                elif alt['orientation'] == '-' and alt['mate_orientation'] == '-':
+                    x[-1].extend([1,1,0,0])
+                else:
+                    print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
             else:
-                print(f'Error: Unexpected "orientation={alt["orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
-        else:
-            print(f'Error: Unexpected "mate_orientation={alt["mate_orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
+                print(f'Error: Unexpected "mate_orientation={alt["mate_orientation"]}" for a BND, but mate was not found. Record ID: {indentifier}')
         
         y.append(is_true)
         records.append(record)
         if added_feature_status == False:
-            feature_names.extend(["hapestry_data_" + str(i) for i in range(2*len(data)+len([0]*7) if concatenate_bnds else len(data)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
+            if features:
+                if concatenate_bnds:
+                    hap_range = 2*len(hapestry_reads)+len([0]*7)
+                elif max_bnds or sum_bnds or average_bnds:
+                    hap_range = len(hapestry_reads)+len([0]*7)
+                else:
+                    print('Error line 191')
+
+            else:
+                if concatenate_bnds:
+                    hap_range = 2*len(hapestry_reads)#+len([0]*7)
+                elif max_bnds or sum_bnds or average_bnds:
+                    hap_range = len(hapestry_reads)#+len([0]*7)
+                else:
+                    print('Error line 191')
+
+            feature_names.extend(["hapestry_data_" + str(i) for i in range(hap_range)])
+            # feature_names.extend(["hapestry_data_" + str(i) for i in range(2*len(data)+len([0]*7) if concatenate_bnds else len(data)+len([0]*7) if max_bnds or sum_bnds or average_bnds else None)])
             added_feature_status = feature_length_verification(x, feature_names)     
 
 

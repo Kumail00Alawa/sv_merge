@@ -418,12 +418,15 @@ def plot_tandem_stratified_roc_curves(axes, records, y_true, y_predict, truth_in
             non_tandem[0].append(y_true[r])
             non_tandem[1].append(y_predict[r])
 
-    label = truth_info_name + " truth labels and " + annotation_name + " features TANDEM"
+    auc_tandem = round(roc_auc_score(y_true=tandem[0], y_score=tandem[1]), 6)
+    auc_non_tandem = round(roc_auc_score(y_true=non_tandem[0], y_score=non_tandem[1]), 6)
+
+    label = truth_info_name + " truth labels and " + annotation_name + " features TANDEM, " + "AUC = " + str(auc_tandem)
     axes, fpr, tpr, thresholds = plot_roc_curve(y_true=tandem[0], y_predict=tandem[1], label=label, axes=axes, style=':')
 
     color = axes.get_lines()[-1].get_color()
 
-    label = truth_info_name + " truth labels and " + annotation_name + " features NON-TANDEM"
+    label = truth_info_name + " truth labels and " + annotation_name + " features NON-TANDEM, " + "AUC = " + str(auc_non_tandem)
     axes, fpr, tpr, thresholds = plot_roc_curve(y_true=non_tandem[0], y_predict=non_tandem[1], label=label, color=color, axes=axes)
 
     return axes
@@ -503,13 +506,13 @@ def main():
         "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG02572.vcf.gz", #02572
         "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG03098.vcf.gz", #03098
         "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG03492.vcf.gz", #03492
-        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG002.vcf.gz", #002
+        # "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG002.vcf.gz", #002
         # "../data/hprc_08x_TEST_5_min_sv_length_2k/HG00438.vcf.gz", #00438
     ]
 
     test_vcfs = [
         "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG00673.vcf.gz", #00673
-        "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG00733.vcf.gz", #00733
+        # "../../data/sv_merge/hprc_08x_TEST_5_min_sv_length_2k/HG00733.vcf.gz", #00733
         # "../data/hprc_08x_TEST_5_min_sv_length_2k/HG005.vcf.gz", #005
     ]
 
@@ -534,13 +537,14 @@ def main():
     # Set data processing conditions
     data_conditions = {
     # Setting 'simple_bnds' to False will ignore the the condition of 'evaluate_bnds'
-    'all_bnds' : True, # When set to true, the code will include all types of BNDs (simple and complex) for training, testing, and evaluation datasets. Otherwise, the code will only consider complex BNDs
-    'evaluate_complex_bnds' : True, # When set to true, the code will only evaluate complex BNDs (this only affects evaluation)
+    'all_bnds' : True, # When set to true, the code will include all types of BNDs (simple and complex) for training, testing, and evaluation datasets. Otherwise, the code will only consider complex BNDs - Currently the code only considers the actual BNDs
+    'evaluate_complex_bnds' : True, # When set to true, the code will only evaluate complex BNDs (this only affects evaluation) - Currently the code only considers the actual BNDs
     # Only set one of the following conditions as true at a time
-    'concatenate_bnds' : True, # When set to true, the code will concatenate ID & MATEID data
-    'max_bnds' : False, # When set to true, the code will obtain the maximum of ID & MATEID data
+    'concatenate_bnds' : False, # When set to true, the code will concatenate ID & MATEID data
+    'max_bnds' : True, # When set to true, the code will obtain the maximum of ID & MATEID data
     'sum_bnds' : False, # When set to true, the code will add the data of ID & MATEID
     'average_bnds' : False, # When set to true, the code will obtain average the data of ID & MATEID
+    'features' : False, # When set to true, the code will include all of the features of a given record. The example of the features: BND Connection such as: intra, inter, and single BND & BND Direction: +/+, +/-, -/+, -/- 
     }
 
     # Write a bunch of config files for record keeping
@@ -600,6 +604,8 @@ def main():
         write_filtered_vcf(y_predict=y_predict, threshold=0.5, records=records, input_vcf_path=eval_vcfs[0], output_vcf_path=os.path.join(output_dir, label.replace(" ", "_") + ".vcf"))
 
         y_true, y_predict = downsample_test_data(y_true, y_predict)
+        auc = round(roc_auc_score(y_true=y_true, y_score=y_predict), 6)
+        auc_label = label + ", AUC = " + str(auc)
 
         # print shape of y_predict and y_true; print all values in one element
         print("y_predict shape: ", y_predict.shape)
@@ -607,16 +613,16 @@ def main():
         print('y_predict y')
         print(y_predict[0], y_true[0])
 
-        axes, fpr, tpr, thresholds = plot_roc_curve(y_true=y_true, y_predict=y_predict, axes=axes, label=label, use_text=True)
+        axes, fpr, tpr, thresholds = plot_roc_curve(y_true=y_true, y_predict=y_predict, axes=axes, label=auc_label, use_text=True)
 
         roc_data[label] = (fpr, tpr, thresholds)
-
+    
     # Generate a legend for axes and force bottom right location
-    axes.plot([0, 1], [0, 1], linestyle='--', label="Random classifier", color="gray")
+    axes.plot([0, 1], [0, 1], linestyle='--', label="Random classifier, AUC = 0.5", color="gray")
     axes.legend(loc="lower right", fontsize='small')
     fig.savefig(os.path.join(output_dir,"roc_curve_all_combos.png"), dpi=200)
 
-    tandem_axes.plot([0, 1], [0, 1], linestyle='--', label="Random classifier", color="gray")
+    tandem_axes.plot([0, 1], [0, 1], linestyle='--', label="Random classifier, AUC = 0.5", color="gray")
     tandem_axes.legend(loc="lower right", fontsize='small')
     tandem_fig.savefig(os.path.join(output_dir,"roc_curve_tandem_stratified.png"), dpi=200)
 
